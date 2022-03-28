@@ -21,7 +21,6 @@ setup(
         'django_tenants.postgresql_backend',
         'django_tenants.management',
         'django_tenants.management.commands',
-        'django_tenants.migration_executors',
         'django_tenants.template',
         'django_tenants.template.loaders',
         'django_tenants.templatetags',

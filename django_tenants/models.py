@@ -1,32 +1,30 @@
 from django.conf import settings
 from django.contrib.sites.shortcuts import get_current_site
 from django.core.management import call_command
-from django.db import models, connections, transaction
+from django.db import connection, models, connections, transaction
+from django.db.models.fields.related import RelatedField
 from django.urls import reverse
+from django.core import checks
 
-from django_tenants.clone import CloneSchema
 from .postgresql_backend.base import _check_schema_name
-from .signals import post_schema_sync, schema_needs_to_be_sync
-from .utils import get_creation_fakes_migrations, get_tenant_base_schema
-from .utils import schema_exists, get_tenant_domain_model, get_public_schema_name, get_tenant_database_alias
+from .utils import get_tenant_model, get_tenant_domain_model, get_public_schema_name, get_tenant_database_alias
+from .fields import RLSForeignKey, generate_rls_fk_field
 
+
+def get_tenant():
+    tenant = connection.tenant
+    if tenant is None:
+        raise Exception(
+            "No tenant configured in db connection, connection.tenant is none"
+        )
+    model = get_tenant_model()
+    return (
+        tenant if isinstance(tenant, model) else model(schema_name=tenant.schema_name)
+    )
 
 class TenantMixin(models.Model):
     """
     All tenant models must inherit this class.
-    """
-
-    auto_drop_schema = False
-    """
-    USE THIS WITH CAUTION!
-    Set this flag to true on a parent class if you want the schema to be
-    automatically deleted if the tenant row gets deleted.
-    """
-
-    auto_create_schema = True
-    """
-    Set this flag to false on a parent class if you don't want the schema
-    to be automatically created upon save.
     """
 
     schema_name = models.CharField(max_length=63, unique=True, db_index=True,
@@ -106,102 +104,9 @@ class TenantMixin(models.Model):
 
         super().save(*args, **kwargs)
 
-        if has_schema and is_new and self.auto_create_schema:
-            try:
-                self.create_schema(check_if_exists=True, verbosity=verbosity)
-                post_schema_sync.send(sender=TenantMixin, tenant=self.serializable_fields())
-            except Exception:
-                # We failed creating the tenant, delete what we created and
-                # re-raise the exception
-                self.delete(force_drop=True)
-                raise
-        elif is_new:
-            # although we are not using the schema functions directly, the signal might be registered by a listener
-            schema_needs_to_be_sync.send(sender=TenantMixin, tenant=self.serializable_fields())
-        elif not is_new and self.auto_create_schema and not schema_exists(self.schema_name):
-            # Create schemas for existing models, deleting only the schema on failure
-            try:
-                self.create_schema(check_if_exists=True, verbosity=verbosity)
-                post_schema_sync.send(sender=TenantMixin, tenant=self.serializable_fields())
-            except Exception:
-                # We failed creating the schema, delete what we created and
-                # re-raise the exception
-                self._drop_schema()
-                raise
-
     def serializable_fields(self):
         """ in certain cases the user model isn't serializable so you may want to only send the id """
         return self
-
-    def _drop_schema(self, force_drop=False):
-        """ Drops the schema"""
-        connection = connections[get_tenant_database_alias()]
-        has_schema = hasattr(connection, 'schema_name')
-        if has_schema and connection.schema_name not in (self.schema_name, get_public_schema_name()):
-            raise Exception("Can't delete tenant outside it's own schema or "
-                            "the public schema. Current schema is %s."
-                            % connection.schema_name)
-
-        if has_schema and schema_exists(self.schema_name) and (self.auto_drop_schema or force_drop):
-            self.pre_drop()
-            cursor = connection.cursor()
-            cursor.execute('DROP SCHEMA "%s" CASCADE' % self.schema_name)
-
-    def pre_drop(self):
-        """
-        This is a routine which you could override to backup the tenant schema before dropping.
-        :return:
-        """
-
-    def delete(self, force_drop=False, *args, **kwargs):
-        """
-        Deletes this row. Drops the tenant's schema if the attribute
-        auto_drop_schema set to True.
-        """
-        self._drop_schema(force_drop)
-        super().delete(*args, **kwargs)
-
-    def create_schema(self, check_if_exists=False, sync_schema=True,
-                      verbosity=1):
-        """
-        Creates the schema 'schema_name' for this tenant. Optionally checks if
-        the schema already exists before creating it. Returns true if the
-        schema was created, false otherwise.
-        """
-
-        # safety check
-        connection = connections[get_tenant_database_alias()]
-        _check_schema_name(self.schema_name)
-        cursor = connection.cursor()
-
-        if check_if_exists and schema_exists(self.schema_name):
-            return False
-
-        fake_migrations = get_creation_fakes_migrations()
-
-        if sync_schema:
-            if fake_migrations:
-                # copy tables and data from provided model schema
-                base_schema = get_tenant_base_schema()
-                clone_schema = CloneSchema()
-                clone_schema.clone_schema(base_schema, self.schema_name)
-
-                call_command('migrate_schemas',
-                             tenant=True,
-                             fake=True,
-                             schema_name=self.schema_name,
-                             interactive=False,
-                             verbosity=verbosity)
-            else:
-                # create the schema
-                cursor.execute('CREATE SCHEMA "%s"' % self.schema_name)
-                call_command('migrate_schemas',
-                             tenant=True,
-                             schema_name=self.schema_name,
-                             interactive=False,
-                             verbosity=verbosity)
-
-        connection.set_schema_to_public()
 
     def get_primary_domain(self):
         """
@@ -231,6 +136,147 @@ class TenantMixin(models.Model):
         :return: str
         """
         return getattr(self, settings.MULTI_TYPE_DATABASE_FIELD)
+
+
+
+class MultitenantMixin(models.Model):
+    """
+    Mixin for any shared schema table (multitenant table). Adds a FK to the Tenant Model
+    and enforces all constraints to the table to work with Row Level Security.
+    """
+
+    tenant = generate_rls_fk_field()
+
+    class Meta:
+        abstract = True
+
+    @classmethod
+    def check(cls, **kwargs):
+        errors = super().check(**kwargs)
+        errors.extend(cls._run_check_tenant_field())
+        errors.extend(cls._run_check_m2m_fields())
+        errors.extend(cls._run_check_unique_together())
+        errors.extend(cls._run_check_uniques())
+        return errors
+
+    @classmethod
+    def _get_tenant_field(cls):
+        all_fields = cls._meta.get_fields()
+        tenant_fields = [field for field in all_fields if field.name == "tenant"]
+        tenant_field = tenant_fields[0] if tenant_fields else None
+        return tenant_field
+
+    @classmethod
+    def _run_check_tenant_field(cls):
+        tenant_field = cls._get_tenant_field()
+        object_name = cls._meta.object_name
+
+        # Ensure that tenant field are still present.
+        if not tenant_field:
+            return [
+                checks.Critical(
+                    f"tenant field not present in {object_name}",
+                    obj=cls,
+                    id=f"tenant_schemas.{object_name}.tenant_field.C001",
+                )
+            ]
+        # Ensure that tenant field is instance of RLSForeignKey.
+        elif not isinstance(tenant_field, RLSForeignKey):
+            return [
+                checks.WARNING(
+                    f"tenant field isn't instance of {RLSForeignKey.__name__} in {object_name}",
+                    obj=cls,
+                    id=f"tenant_schemas.{object_name}.tenant_field.W001",
+                )
+            ]
+
+        return list()
+
+    @classmethod
+    def _run_check_m2m_fields(cls):
+        all_fields = cls._meta.get_fields()
+
+        warnings = list()
+
+        # Ensure that m2m field related model has tenant field and is an instance of RLSForeignKey
+        m2m_fields = (
+            field for field in all_fields if isinstance(field, models.ManyToManyField)
+        )
+        for m2m_field in m2m_fields:
+            through_all_fields = m2m_field.remote_field.through._meta.get_fields()
+            through_tenant_fields = [
+                field for field in through_all_fields if field.name == "tenant"
+            ]
+            through_tenant_field = (
+                through_tenant_fields[0] if through_tenant_fields else None
+            )
+            through_object_name = m2m_field.remote_field.through._meta.object_name
+
+            auto_or_manual_model = (
+                "auto-created"
+                if m2m_field.remote_field.through._meta.auto_created
+                else "manual"
+            )
+
+            if not through_tenant_field:
+                warnings.append(
+                    checks.Warning(
+                        f"tenant field not present in Many2Many {auto_or_manual_model} model: {through_object_name}",
+                        hint=f"Use custom defined model for through property in Many2Many field "
+                        f"{cls._meta.object_name}.{m2m_field.name} using {MultitenantMixin.__name__} "
+                        f"in the model definition",
+                        id=f"tenant_schemas.{through_object_name}.m2m_field.W001",
+                    )
+                )
+            elif not isinstance(through_tenant_field, RLSForeignKey):
+                warnings.append(
+                    checks.Warning(
+                        f"tenant field isn't instance of RLSForeignKey in {through_object_name}",
+                        id=f"tenant_schemas.{through_object_name}.m2m_field.W002",
+                    )
+                )
+
+        return warnings
+
+    @classmethod
+    def _run_check_unique_together(cls):
+        warnings = list()
+
+        if cls._meta.unique_together:
+            object_name = cls._meta.object_name
+            tenant_field = cls._get_tenant_field()
+            for unique_together in cls._meta.unique_together:
+                if tenant_field.name not in unique_together:
+                    warnings.append(
+                        checks.Warning(
+                            f"tenant field isn't in unique_together in {object_name}: {unique_together}",
+                            id=f"tenant_schemas.{object_name}.unique_together_without_tenant.W001",
+                        )
+                    )
+
+        return warnings
+
+    @classmethod
+    def _run_check_uniques(cls):
+        warnings = list()
+
+        for field in cls._meta.get_fields():
+            object_name = cls._meta.object_name
+            if (
+                # related fields can be unique (ie 1-1 field is unique on pkeys so no worries)
+                not isinstance(field, RelatedField)
+                # pkeys are unique anyway
+                and not getattr(field, "primary_key", False)
+                and getattr(field, "unique", False)
+            ):
+                warnings.append(
+                    checks.Warning(
+                        f"Field {field.name} marked as unique in {object_name}. Must use unique together with the tenant_id.",
+                        id=f"tenant_schemas.{object_name}.unique.W001",
+                    )
+                )
+
+        return warnings
 
 
 class DomainMixin(models.Model):
