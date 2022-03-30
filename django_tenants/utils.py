@@ -30,6 +30,8 @@ def get_tenant_field():
 def get_tenant_database_alias():
     return getattr(settings, 'TENANT_DB_ALIAS', DEFAULT_DB_ALIAS)
 
+def get_migration_database_alias():
+    return getattr(settings, 'MIGRATION_DB_ALIAS', DEFAULT_DB_ALIAS)
 
 def get_public_schema_name():
     return getattr(settings, 'PUBLIC_SCHEMA_NAME', 'public')
@@ -276,3 +278,13 @@ def validate_extra_extensions():
 
         # Make sure the connection used for the check is not reused and doesn't stay idle.
         connection.close()
+
+
+def create_stable_tenant_function(using=None):
+    if using is None:
+        using = get_migration_database_alias()
+
+    with connections[using].cursor() as cursor:
+        cursor.execute('CREATE OR REPLACE FUNCTION get_current_tenant() RETURNS VARCHAR AS $$ '
+                        'SELECT current_setting(\'txerpa.tenant\') '
+                        '$$ LANGUAGE SQL STABLE COST 100000;')

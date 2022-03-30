@@ -3,11 +3,10 @@ import logging
 from django.conf import settings
 from django.apps import AppConfig, apps
 from django.core.exceptions import ImproperlyConfigured
-from django_tenants.utils import get_public_schema_name, validate_extra_extensions
+from django_tenants.utils import get_public_schema_name, validate_extra_extensions, create_stable_tenant_function
 from django.db.models.signals import pre_migrate
 from django.core.checks import Critical, Error, Warning, register
 from django.core.management import call_command
-
 
 recommended_config = """
 Warning: The recommend way of setting django tenants up is shown in the documentation.
@@ -18,7 +17,7 @@ logger = logging.getLogger()
 
 def create_or_replace_pg_get_tenant_function(sender, **kwargs):
     logger.info("running create_stable_tenant_function command...")
-    call_command('create_stable_tenant_function')
+    create_stable_tenant_function()
     logger.info("OK")
 
 
