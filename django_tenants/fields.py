@@ -19,5 +19,6 @@ def generate_rls_fk_field(related_name="+"):
         blank=True,
         default=get_tenant,
         on_delete=models.PROTECT,
-        related_name=related_name
+        related_name=related_name,
+        editable=False,
     )
