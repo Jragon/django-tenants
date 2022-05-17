@@ -31,7 +31,6 @@ class TenantTestCase(TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.sync_shared()
         cls.add_allowed_test_domain()
         cls.tenant = get_tenant_model()(schema_name=cls.get_test_schema_name())
         cls.setup_tenant(cls.tenant)
@@ -49,7 +48,7 @@ class TenantTestCase(TestCase):
     def tearDownClass(cls):
         connection.set_schema_to_public()
         cls.domain.delete()
-        cls.tenant.delete(force_drop=True)
+        cls.tenant.delete()
         cls.remove_allowed_test_domain()
 
     @classmethod
@@ -70,13 +69,6 @@ class TenantTestCase(TestCase):
 
         if tenant_domain in settings.ALLOWED_HOSTS:
             settings.ALLOWED_HOSTS.remove(tenant_domain)
-
-    @classmethod
-    def sync_shared(cls):
-        call_command('migrate_schemas',
-                     schema_name=get_public_schema_name(),
-                     interactive=False,
-                     verbosity=0)
 
     @classmethod
     def get_test_tenant_domain(cls):
