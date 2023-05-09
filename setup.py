@@ -8,7 +8,7 @@ try:
 except ImportError:
     from distutils.core import setup
 
-__version__ = "4.0.1"
+__version__ = "4.0.2"
 
 setup(
     name='django-tenants',
@@ -45,6 +45,8 @@ setup(
         'Framework :: Django :: 3.0',
         'Framework :: Django :: 3.1',
         'Framework :: Django :: 4.0',
+        'Framework :: Django :: 4.1',
+        'Framework :: Django :: 4.2',
         'Programming Language :: Python',
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
@@ -54,7 +56,7 @@ setup(
         'Topic :: Software Development :: Libraries :: Python Modules'
     ],
     install_requires=[
-        'Django >= 2.1,<=4.1',
+        'Django >= 2.1,<=4.3',
     ],
     zip_safe=False,
 )
